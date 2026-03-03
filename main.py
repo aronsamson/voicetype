@@ -62,6 +62,7 @@ class VoiceType:
         self.llm = LLMProcessor(self.settings)
         self.injector = TextInjector(self.settings)
         self.hotkey = HotkeyManager(self.settings)
+        self._state_lock = threading.RLock()  # 執行緒安全狀態鎖
         self.is_recording = False
         self.processing = False
         self.tray_icon = None
@@ -72,13 +73,14 @@ class VoiceType:
 
     def on_hotkey_press(self):
         """快捷鍵按下：開始錄音"""
-        if self.is_recording or self.processing:
-            return
+        with self._state_lock:
+            if self.is_recording or self.processing:
+                return
+            self.is_recording = True
         # 記住目前的前景視窗（使用者正在操作的視窗）
         self._target_hwnd = ctypes.windll.user32.GetForegroundWindow()
         # 取得該視窗的執行緒 ID，用於 AttachThreadInput
         self._target_thread_id = ctypes.windll.user32.GetWindowThreadProcessId(self._target_hwnd, None)
-        self.is_recording = True
         play_start()
         self.recorder.start()
         logger.info("Recording started (target hwnd: 0x%x)...", self._target_hwnd)
@@ -86,34 +88,71 @@ class VoiceType:
 
     def on_hotkey_release(self):
         """快捷鍵釋放：停止錄音 → STT → LLM → 注入"""
-        if not self.is_recording:
-            return
-        self.is_recording = False
-        self.processing = True
+        with self._state_lock:
+            if not self.is_recording:
+                return
+            self.is_recording = False
+            self.processing = True
         play_stop()
-
-        # 立即按 Escape 取消瀏覽器的 Alt 選單激活（suppress=False 時 Alt 會穿透）
-        try:
-            import pyautogui
-            pyautogui.press("escape")
-        except Exception:
-            pass
 
         audio_data = self.recorder.stop()
         logger.info("Recording stopped (%.1f sec), processing...", len(audio_data) / 16000)
         self._update_tray("處理中...", "processing")
 
-        # 背景執行緒處理，避免阻塞快捷鍵
-        threading.Thread(target=self._process_audio, args=(audio_data,), daemon=True).start()
+        # 使用帶超時的背景執行緒
+        thread = threading.Thread(
+            target=self._process_audio_with_watchdog,
+            args=(audio_data,),
+            daemon=True
+        )
+        thread.start()
 
     # ── 語音處理管線 ─────────────────────────────────────────────────────────
 
-    def _process_audio(self, audio_data):
-        """STT → LLM → 文字注入"""
-        # 背景執行緒也需要初始化 COM 為 STA（httpx 可能會改變 COM 模式）
-        ctypes.windll.ole32.CoInitializeEx(None, 2)
+    def _process_audio_with_watchdog(self, audio_data):
+        """包裝器，帶超時保護"""
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._process_audio, audio_data)
+            try:
+                future.result(timeout=30.0)  # 30 秒最大限制
+            except concurrent.futures.TimeoutError:
+                logger.error("Processing timeout after 30s - forcing hook recovery")
+                self._emergency_hook_recovery()
+            except Exception as e:
+                logger.error("Processing error: %s", e, exc_info=True)
+                self._emergency_hook_recovery()
+
+    def _emergency_hook_recovery(self):
+        """緊急 hook 恢復"""
+        logger.warning("Emergency hook recovery triggered")
+        with self._state_lock:
+            self.processing = False
+            self.is_recording = False
+
         try:
-            # 太短的錄音直接跳過
+            # 停止並重新註冊
+            self.hotkey.stop()
+            time.sleep(0.1)
+            self.hotkey.register(
+                on_press=self.on_hotkey_press,
+                on_release=self.on_hotkey_release,
+            )
+            logger.info("Hook forcibly recovered")
+        except Exception as e:
+            logger.error("Hook recovery failed: %s", e)
+
+        self._update_tray("就緒", "idle")
+
+    def _process_audio(self, audio_data):
+        """STT → LLM → 焦點恢復 → unhook → 注入 → rehook"""
+        # 背景執行緒也需要初始化 COM 為 STA
+        ctypes.windll.ole32.CoInitializeEx(None, 2)
+        hook_unhooked = False
+
+        try:
+            # 檢查錄音長度
             duration = len(audio_data) / 16000
             if duration < MIN_RECORDING_SECONDS:
                 logger.warning("Recording too short (%.1fs), skipped", duration)
@@ -132,27 +171,45 @@ class VoiceType:
 
             logger.info("Raw text (%.1fs): %s", stt_time, raw_text)
 
-            # 步驟 2：LLM 智能修飾（傳入目標視窗以避免再次呼叫 GetForegroundWindow）
+            # 步驟 2：LLM 智能修飾
             t1 = time.time()
             polished = self.llm.polish(raw_text, target_hwnd=self._target_hwnd)
             llm_time = time.time() - t1
             logger.info("Polished (%.1fs): %s", llm_time, polished)
 
-            # 步驟 3：暫停 keyboard hook → 恢復前景視窗 → 注入 → 重新註冊
-            self.hotkey.unhook()
-            time.sleep(INJECT_DELAY_SECONDS)
+            # ==========================================
+            # 關鍵修復：恢復焦點 BEFORE unhook
+            # ==========================================
 
-            # 恢復使用者原本操作的視窗到前景（使用多種方法確保成功）
+            # 步驟 3：恢復焦點（此時 hook 仍然活躍）
             if self._target_hwnd:
-                self._restore_focus(self._target_hwnd)
+                focus_success = self._restore_focus(self._target_hwnd)
+                if not focus_success:
+                    logger.warning("Focus restoration failed, but continuing with injection")
+                time.sleep(0.05)  # 讓焦點穩定
 
+            # 步驟 4：發送 Escape 鍵（取消 Alt 選單，現在發送到正確視窗）
+            try:
+                import pyautogui
+                pyautogui.press("escape")
+                time.sleep(0.02)
+            except Exception as e:
+                logger.warning("Failed to send escape: %s", e)
+
+            # 步驟 5：暫時 unhook（僅在注入期間）
+            self.hotkey.unhook()
+            hook_unhooked = True
+            time.sleep(0.05)  # 短暫暫停
+
+            # 步驟 6：注入文字
             self.injector.inject(polished)
 
-            # 重新註冊快捷鍵
+            # 步驟 7：立即重新註冊 hook
             self.hotkey.register(
                 on_press=self.on_hotkey_press,
                 on_release=self.on_hotkey_release,
             )
+            hook_unhooked = False
 
             total = time.time() - t0
             logger.info("Done! Total %.1fs (STT %.1fs + LLM %.1fs)", total, stt_time, llm_time)
@@ -163,16 +220,17 @@ class VoiceType:
             time.sleep(ERROR_DISPLAY_SECONDS)
 
         finally:
-            # 確保快捷鍵一定會重新註冊，否則 VoiceType 會停止回應
-            if not self.hotkey._press_hook:
+            # 確保 hook 一定會重新註冊
+            if hook_unhooked or not self.hotkey._press_hook:
                 try:
                     self.hotkey.register(
                         on_press=self.on_hotkey_press,
                         on_release=self.on_hotkey_release,
                     )
-                    logger.info("Hotkey re-registered after error recovery")
+                    logger.info("Hotkey re-registered in finally block")
                 except Exception as e2:
-                    logger.error("Failed to re-register hotkey: %s", e2)
+                    logger.error("Failed to re-register hotkey in finally: %s", e2)
+
             self._reset_status()
 
     # ── 輔助方法 ─────────────────────────────────────────────────────────────
@@ -187,64 +245,118 @@ class VoiceType:
                 pass  # 圖標更新非關鍵功能
 
     def _reset_status(self):
-        self.processing = False
+        with self._state_lock:
+            self.processing = False
         self._update_tray("就緒", "idle")
 
+    def _is_thread_alive(self, thread_id):
+        """檢查執行緒 ID 是否仍然有效"""
+        if not thread_id:
+            return False
+
+        # 開啟執行緒控制碼
+        THREAD_QUERY_INFORMATION = 0x0040
+        h_thread = ctypes.windll.kernel32.OpenThread(
+            THREAD_QUERY_INFORMATION, False, thread_id
+        )
+        if not h_thread:
+            return False
+
+        # 檢查退出碼
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeThread(h_thread, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(h_thread)
+
+        STILL_ACTIVE = 259
+        return exit_code.value == STILL_ACTIVE
+
+    def _attach_thread_input_safe(self, thread_from, thread_to, attach=True, timeout=1.0):
+        """AttachThreadInput with timeout protection"""
+        import concurrent.futures
+
+        def do_attach():
+            return ctypes.windll.user32.AttachThreadInput(thread_from, thread_to, attach)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(do_attach)
+            try:
+                result = future.result(timeout=timeout)
+                return result
+            except concurrent.futures.TimeoutError:
+                logger.error("AttachThreadInput timeout after %.1fs", timeout)
+                return False
+            except Exception as e:
+                logger.error("AttachThreadInput failed: %s", e)
+                return False
+
     def _restore_focus(self, hwnd):
-        """使用多種方法強制恢復焦點到目標視窗"""
+        """使用簡化的焦點恢復（避免死鎖）"""
         try:
             user32 = ctypes.windll.user32
 
-            # 檢查視窗是否仍然有效
+            # 驗證視窗仍然存在
             if not user32.IsWindow(hwnd):
                 logger.warning("Target window no longer exists")
-                return
+                return False
 
-            # 方法 1：使用 AttachThreadInput 強制切換焦點
-            # 這是最可靠的方法，可以繞過 Windows 的焦點限制
+            # 方法 1：簡單 SetForegroundWindow（適用於 90% 情況）
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
+
+            # 驗證成功
+            current_fg = user32.GetForegroundWindow()
+            if current_fg == hwnd:
+                logger.info("Focus restored successfully (simple method)")
+                return True
+
+            # 方法 2：進階恢復（使用 AttachThreadInput 作為後備）
+            logger.info("Simple focus restoration failed, trying advanced method")
+
             current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
             target_thread = self._target_thread_id
 
-            if target_thread and target_thread != current_thread:
-                # 將當前執行緒附加到目標視窗的執行緒
-                user32.AttachThreadInput(current_thread, target_thread, True)
+            # 驗證執行緒存活
+            if not target_thread or not self._is_thread_alive(target_thread):
+                logger.warning("Target thread invalid or dead, cannot use AttachThreadInput")
+                return False
 
-            # 方法 2：先顯示視窗（只在被最小化時才還原，避免影響最大化視窗）
-            SW_MINIMIZE = 6
-            SW_RESTORE = 9
-            if user32.IsIconic(hwnd):  # 只有在視窗被最小化時才還原
-                user32.ShowWindow(hwnd, SW_RESTORE)
-                time.sleep(0.02)
+            if target_thread == current_thread:
+                logger.info("Same thread, no AttachThreadInput needed")
+                return False
 
-            # 方法 3：將視窗帶到最上層
-            HWND_TOP = 0
-            SWP_NOSIZE = 0x0001
-            SWP_NOMOVE = 0x0002
-            user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
-            time.sleep(0.02)
+            # 使用有超時保護的 AttachThreadInput
+            attached = self._attach_thread_input_safe(current_thread, target_thread, True, timeout=1.0)
+            if not attached:
+                return False
 
-            # 方法 4：設置為前景視窗
-            user32.SetForegroundWindow(hwnd)
-            time.sleep(0.02)
+            try:
+                # 如果被最小化，恢復
+                if user32.IsIconic(hwnd):
+                    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    time.sleep(0.02)
 
-            # 方法 5：設置焦點
-            user32.SetFocus(hwnd)
-            time.sleep(0.05)
+                # 設置前景
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.05)
 
-            # 解除執行緒附加
-            if target_thread and target_thread != current_thread:
-                user32.AttachThreadInput(current_thread, target_thread, False)
+            finally:
+                # 確保 detach
+                self._attach_thread_input_safe(current_thread, target_thread, False, timeout=0.5)
 
-            # 驗證焦點是否恢復成功
+            # 最終驗證
             current_fg = user32.GetForegroundWindow()
-            if current_fg == hwnd:
-                logger.info("Focus restored successfully to hwnd 0x%x", hwnd)
+            success = (current_fg == hwnd)
+            if success:
+                logger.info("Focus restored successfully (advanced method)")
             else:
-                logger.warning("Focus restoration may have failed (current: 0x%x, target: 0x%x)",
+                logger.warning("Focus restoration failed (current: 0x%x, target: 0x%x)",
                              current_fg, hwnd)
 
+            return success
+
         except Exception as e:
-            logger.error("Failed to restore focus: %s", e)
+            logger.error("Failed to restore focus: %s", e, exc_info=True)
+            return False
 
     def _create_tray_icon(self):
         """建立系統托盤圖示"""
