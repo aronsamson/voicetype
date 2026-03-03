@@ -66,6 +66,7 @@ class VoiceType:
         self.processing = False
         self.tray_icon = None
         self._target_hwnd = None
+        self._target_thread_id = None
 
     # ── 快捷鍵回呼 ───────────────────────────────────────────────────────────
 
@@ -75,10 +76,12 @@ class VoiceType:
             return
         # 記住目前的前景視窗（使用者正在操作的視窗）
         self._target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        # 取得該視窗的執行緒 ID，用於 AttachThreadInput
+        self._target_thread_id = ctypes.windll.user32.GetWindowThreadProcessId(self._target_hwnd, None)
         self.is_recording = True
         play_start()
         self.recorder.start()
-        logger.info("Recording started...")
+        logger.info("Recording started (target hwnd: 0x%x)...", self._target_hwnd)
         self._update_tray("錄音中...", "recording")
 
     def on_hotkey_release(self):
@@ -129,9 +132,9 @@ class VoiceType:
 
             logger.info("Raw text (%.1fs): %s", stt_time, raw_text)
 
-            # 步驟 2：LLM 智能修飾
+            # 步驟 2：LLM 智能修飾（傳入目標視窗以避免再次呼叫 GetForegroundWindow）
             t1 = time.time()
-            polished = self.llm.polish(raw_text)
+            polished = self.llm.polish(raw_text, target_hwnd=self._target_hwnd)
             llm_time = time.time() - t1
             logger.info("Polished (%.1fs): %s", llm_time, polished)
 
@@ -139,13 +142,9 @@ class VoiceType:
             self.hotkey.unhook()
             time.sleep(INJECT_DELAY_SECONDS)
 
-            # 恢復使用者原本操作的視窗到前景
+            # 恢復使用者原本操作的視窗到前景（使用多種方法確保成功）
             if self._target_hwnd:
-                try:
-                    ctypes.windll.user32.SetForegroundWindow(self._target_hwnd)
-                    time.sleep(0.05)
-                except Exception:
-                    pass
+                self._restore_focus(self._target_hwnd)
 
             self.injector.inject(polished)
 
@@ -190,6 +189,60 @@ class VoiceType:
     def _reset_status(self):
         self.processing = False
         self._update_tray("就緒", "idle")
+
+    def _restore_focus(self, hwnd):
+        """使用多種方法強制恢復焦點到目標視窗"""
+        try:
+            user32 = ctypes.windll.user32
+
+            # 檢查視窗是否仍然有效
+            if not user32.IsWindow(hwnd):
+                logger.warning("Target window no longer exists")
+                return
+
+            # 方法 1：使用 AttachThreadInput 強制切換焦點
+            # 這是最可靠的方法，可以繞過 Windows 的焦點限制
+            current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+            target_thread = self._target_thread_id
+
+            if target_thread and target_thread != current_thread:
+                # 將當前執行緒附加到目標視窗的執行緒
+                user32.AttachThreadInput(current_thread, target_thread, True)
+
+            # 方法 2：先顯示視窗（如果被最小化）
+            SW_RESTORE = 9
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            time.sleep(0.02)
+
+            # 方法 3：將視窗帶到最上層
+            HWND_TOP = 0
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            time.sleep(0.02)
+
+            # 方法 4：設置為前景視窗
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.02)
+
+            # 方法 5：設置焦點
+            user32.SetFocus(hwnd)
+            time.sleep(0.05)
+
+            # 解除執行緒附加
+            if target_thread and target_thread != current_thread:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+
+            # 驗證焦點是否恢復成功
+            current_fg = user32.GetForegroundWindow()
+            if current_fg == hwnd:
+                logger.info("Focus restored successfully to hwnd 0x%x", hwnd)
+            else:
+                logger.warning("Focus restoration may have failed (current: 0x%x, target: 0x%x)",
+                             current_fg, hwnd)
+
+        except Exception as e:
+            logger.error("Failed to restore focus: %s", e)
 
     def _create_tray_icon(self):
         """建立系統托盤圖示"""

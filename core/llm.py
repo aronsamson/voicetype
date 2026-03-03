@@ -16,11 +16,15 @@ class LLMProcessor:
 
     def __init__(self, settings):
         self.settings = settings
+        self._target_hwnd = None
 
-    def polish(self, raw_text: str) -> str:
+    def polish(self, raw_text: str, target_hwnd=None) -> str:
         """將 STT 原始文字修飾為乾淨的輸出"""
         cfg = self.settings.get_config()
         provider = cfg.get("llmProvider", "openai")
+
+        # 儲存目標視窗供 _detect_context 使用
+        self._target_hwnd = target_hwnd
 
         # 如果文字很短且乾淨，可以跳過 LLM
         if len(raw_text.strip()) < 3:
@@ -66,7 +70,10 @@ class LLMProcessor:
         """偵測當前使用的 App 來調整語氣"""
         try:
             import win32gui
-            hwnd = win32gui.GetForegroundWindow()
+            # 使用快取的 hwnd，避免再次呼叫 GetForegroundWindow（此時焦點可能已改變）
+            hwnd = getattr(self, '_target_hwnd', None)
+            if not hwnd:
+                hwnd = win32gui.GetForegroundWindow()
             title = win32gui.GetWindowText(hwnd).lower()
 
             if any(k in title for k in ["outlook", "gmail", "mail", "thunderbird"]):
